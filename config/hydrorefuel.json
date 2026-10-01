@@ -1,7 +1,8 @@
 {
   "station": {
     "name": "refueling-control",
-    "storage_root": "var/state"
+    "storage_root": "var/state",
+    "recovery_policy": "resume"
   },
   "limits": {
     "truck": {

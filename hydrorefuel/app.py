@@ -40,7 +40,8 @@ from .ns.topology import Topology, build_default_topology
 from .queue.confirm import Confirmation
 from .queue.queue import FillQueue
 from .queue.snapshot import QueueSnapshot
-from .sequence import fill_vehicle, pressurize_buffer, stop_fill, unload_truck
+from .recovery import RecoveryRuntime
+from .sequence import pressurize_buffer, stop_fill
 from .store.journal import JsonlJournal
 from .store.jsonfile import JsonStore
 from .telemetry import TrendBuffer
@@ -103,6 +104,7 @@ class Platform:
         self.leak_latch = LeakLatch(self.config.leak.hold_s)
         self.queue = FillQueue(self.config.queue)
         self.confirm = Confirmation(self.config.queue.confirm_timeout_s)
+        self.recovery = RecoveryRuntime(self)
 
         self._cycles = 0
         self._operations = 0
@@ -139,6 +141,27 @@ class Platform:
         if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
+        self.recovery.restore()
+        decision = self.recovery.decision().as_dict()
+        if decision["pending"]:
+            self.bus.publish(
+                Event.of(
+                    "recovery",
+                    "recovery",
+                    "recovery_detected",
+                    severity="warning",
+                    station=self.unit,
+                    scope=decision["scope"],
+                    decision_action=decision["action"],
+                    safe_to_resume=decision["safe_to_resume"],
+                    operation=str(decision.get("operation") or ""),
+                    stage=str(decision.get("stage") or ""),
+                    measured_kg=decision["measured_kg"],
+                    accounted_kg=decision["accounted_kg"],
+                    remaining_kg=decision["remaining_kg"],
+                    reasons=",".join(decision["reasons"]),
+                )
+            )
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -229,12 +252,19 @@ class Platform:
         hose_pressure_mpa: float = 20.0,
         target_kg: float = 20.0,
         dt: float = 1.0,
+        interrupt_after: str | None = None,
     ) -> dict:
-        """卸氢编排：连接软管 → 卸氢 → 泄压放散 → 拔管。"""
+        """卸氢编排：连接软管 → 卸氢 → 泄压放散 → 拔管；支持工位级续作。"""
 
         with self._lock:
             op_id = self.ids.next()
-            report = unload_truck(self.truck, self.vent, self.vent_latch, self.unit, hose_pressure_mpa, target_kg, dt)
+            report = self.recovery.unload(
+                op_id=op_id,
+                hose_pressure_mpa=hose_pressure_mpa,
+                target_kg=target_kg,
+                dt=dt,
+                interrupt_after=interrupt_after,
+            )
             summary = self._record_operation(op_id, "unload", report)
             self._operations += 1
             self._persist()
@@ -264,6 +294,7 @@ class Platform:
                 dt=dt,
             )
             summary = self._record_operation(op_id, "pressurize", report)
+            self.recovery.persist()
             self._operations += 1
             self._persist()
             return {**report, **summary}
@@ -274,37 +305,24 @@ class Platform:
         rate_kg_per_min: float = 3.0,
         steps: int = 3,
         dt: float = 36.0,
+        interrupt_after: str | None = None,
     ) -> dict:
         """加注编排：队列确认 → 枪落座 → 预冷 → 加注 → 隔离停机 → 枪回位。"""
 
         with self._lock:
             op_id = self.ids.next()
             try:
-                self.dispenser.check_line_pressure(self.bank.pressure_mpa)
+                report = self.recovery.fill(
+                    op_id=op_id,
+                    vehicle=vehicle,
+                    rate_kg_per_min=rate_kg_per_min,
+                    steps=steps,
+                    dt=dt,
+                    interrupt_after=interrupt_after,
+                )
             except HydroError as error:
                 self.note_error(error)
                 return {"station": self.unit, "vehicle": vehicle, "ok": False, "violations": ["line_pressure_high"]}
-            before = self.meter.total_kg()
-            report = fill_vehicle(
-                self.dispenser,
-                self.nozzle,
-                self.precooler,
-                self.temperature,
-                self.meter,
-                self.flow_step,
-                self.confirm,
-                self.unit,
-                vehicle=vehicle,
-                rate_kg_per_min=rate_kg_per_min,
-                steps=steps,
-                now=self.clock.now(),
-                dt=dt,
-            )
-            if report["ok"]:
-                try:
-                    self.bank.draw(self.meter.total_kg() - before)
-                except HydroError as error:
-                    self.note_error(error)
             summary = self._record_operation(op_id, "fill", report)
             self._operations += 1
             self._persist()
@@ -315,20 +333,136 @@ class Platform:
 
         with self._lock:
             op_id = self.ids.next()
-            report = stop_fill(self.dispenser, self.unit)
-            if report["ok"]:
-                self.nozzle.unseat()
-                report["steps"].append(
-                    {
-                        "component": "disp",
-                        "action": "unseat_nozzle",
-                        "detail": {"seated": self.nozzle.is_seated(), "travel_mm": self.nozzle.travel_mm()},
-                    }
-                )
+            checkpoint = self.recovery.current
+            if checkpoint is not None and not checkpoint.terminal():
+                if checkpoint.operation == "fill" and checkpoint.stage == "filled":
+                    report = stop_fill(self.dispenser, self.unit)
+                    if report["ok"]:
+                        self.nozzle.unseat()
+                        report["steps"].append(
+                            {
+                                "component": "disp",
+                                "action": "unseat_nozzle",
+                                "detail": {"seated": self.nozzle.is_seated(), "travel_mm": self.nozzle.travel_mm()},
+                            }
+                        )
+                    self.recovery.clear_operation()
+                else:
+                    decision_before = self.recovery_status()
+                    self.recovery.request_stop()
+                    report = self.recovery.recover(op_id)
+                    self._record_recovery_decision(decision_before, op_id)
+            else:
+                report = stop_fill(self.dispenser, self.unit)
+                if report["ok"]:
+                    self.nozzle.unseat()
+                    report["steps"].append(
+                        {
+                            "component": "disp",
+                            "action": "unseat_nozzle",
+                            "detail": {"seated": self.nozzle.is_seated(), "travel_mm": self.nozzle.travel_mm()},
+                        }
+                    )
+                self.recovery.persist()
             summary = self._record_operation(op_id, "stop_fill", report)
             self._operations += 1
             self._persist()
             return {**report, **summary}
+
+    def request_interrupt(self) -> dict:
+        """请求当前操作在下一个稳定检查点暂停。"""
+
+        with self._lock:
+            requested = self.recovery.request_stop()
+            self.bus.publish(
+                Event.of(
+                    "recovery",
+                    "recovery",
+                    "stop_requested",
+                    severity="warning",
+                    station=self.unit,
+                    accepted=requested,
+                )
+            )
+            return {"requested": requested, "decision": self.recovery_status()}
+
+    def recovery_status(self) -> dict:
+        """返回工位级恢复判断，供控制台展示。"""
+
+        with self._lock:
+            decision = self.recovery.decision().as_dict()
+            return {"scope": "station", **decision}
+
+    def recover_operation(self) -> dict:
+        """按工位策略续作或隔离收尾；重复触发同一检查点保持幂等。"""
+
+        with self._lock:
+            op_id = self.ids.next()
+            decision_before = self.recovery_status()
+            report = self.recovery.recover(op_id)
+            self._record_recovery_decision(decision_before, op_id)
+            for step in report.get("steps", []):
+                self.bus.publish(
+                    Event.of(
+                        str(step.get("component", "recovery")),
+                        str(step.get("component", "recovery")),
+                        str(step.get("action", "recovery_step")),
+                        station=self.unit,
+                        op_id=op_id,
+                        severity="notice",
+                        **{
+                            key: value
+                            for key, value in step.get("detail", {}).items()
+                            if not isinstance(value, (dict, list))
+                        },
+                    )
+                )
+            summary = {
+                "op_id": op_id,
+                "operation": "recovery",
+                "station": self.unit,
+                "ok": bool(report.get("ok")),
+                "violations": list(report.get("violations", [])),
+            }
+            self.bus.publish(
+                Event.of(
+                    "audit",
+                    "audit",
+                    "recovery_complete",
+                    severity="notice" if report.get("ok") else "warning",
+                    **summary,
+                )
+            )
+            self._operations += 1
+            self._persist()
+            return {**report, **summary}
+
+    def _record_recovery_decision(self, decision: dict, op_id: str) -> None:
+        """把恢复判断落审计；字段口径与控制台恢复状态完全一致。"""
+
+        self.bus.publish(
+            Event.of(
+                "recovery",
+                "recovery",
+                "recovery_decision",
+                severity="warning" if decision.get("pending") else "notice",
+                station=self.unit,
+                op_id=op_id,
+                scope=decision["scope"],
+                pending=bool(decision["pending"]),
+                decision_action=str(decision["action"]),
+                safe_to_resume=bool(decision["safe_to_resume"]),
+                operation=str(decision.get("operation") or ""),
+                stage=str(decision.get("stage") or ""),
+                resumed_op_id=str(decision.get("op_id") or ""),
+                stop_requested=bool(decision.get("stop_requested")),
+                recovery_policy=str(decision.get("recovery_policy") or ""),
+                measured_kg=float(decision.get("measured_kg", 0.0)),
+                accounted_kg=float(decision.get("accounted_kg", 0.0)),
+                remaining_kg=float(decision.get("remaining_kg", 0.0)),
+                reasons=",".join(decision.get("reasons", [])),
+            )
+        )
 
     def sample_leak(self, concentration_ppm: float) -> dict:
         """记一次泄漏采样；达到阀值即触发并保持闩锁。"""
@@ -413,9 +547,11 @@ class Platform:
             "confirm_idle": not self.confirm.pending(DEFAULT_VEHICLE),
         }
         recent = self.audit.tail(1)
+        recovery = self.recovery_status()
         return {
-            "ready": all(checks.values()),
+            "ready": all(checks.values()) and not recovery["pending"],
             "checks": checks,
+            "recovery": recovery,
             "stage": {"name": fill_stage.name, "label": fill_stage.label, "requires": list(self.topology.predecessors("fill"))},
             "outstanding_confirms": self.confirm.outstanding(),
             "last_audit_ts": recent[-1]["ts"] if recent else None,
@@ -440,6 +576,7 @@ class Platform:
             pressure = self.bank.pressure_mpa
             self.trend.append("buffer_pressure", moment, pressure)
             self.trend.append("precool_temp", moment, self.temperature.value_c)
+            self.recovery.persist()
             self._persist()
             delta = 0.0 if previous is None else pressure - previous.value
             return {
@@ -531,6 +668,9 @@ class Platform:
             self.leak.reset()
             self.dispenser.reset()
             self.queue.reset()
+            self.recovery.checkpoints.clear(self.unit)
+            self.recovery.checkpoints.clear_runtime(self.unit)
+            self.recovery.current = None
             removed = self.store.remove("platform_state") if self.store.exists("platform_state") else False
             self._operations = 0
             self._cycles = 0
@@ -669,6 +809,7 @@ class Platform:
             "leak_samples": self.leak.samples(),
             "last_audit_ts": self._last_audit_ts,
             "audit": self.audit.summary(),
+            "recovery": self.recovery_status(),
         }
 
     def snapshot(self) -> dict:

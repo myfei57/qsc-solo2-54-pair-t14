@@ -41,6 +41,9 @@ class Api:
         add("GET", "/api/namespaces", lambda params, body: self._platform.namespaces_describe())
         add("GET", "/api/namespace/{address}", self._namespace)
         add("GET", "/api/readiness", lambda params, body: self._platform.readiness())
+        add("GET", "/api/recovery", lambda params, body: self._platform.recovery_status())
+        add("POST", "/api/recovery/recover", lambda params, body: self._platform.recover_operation())
+        add("POST", "/api/recovery/interrupt", lambda params, body: self._platform.request_interrupt())
         add("GET", "/api/truck", lambda params, body: {"truck": self._platform.truck_snapshot()})
         add("GET", "/api/vent", lambda params, body: {"vent": self._platform.vent_snapshot()})
         add("GET", "/api/compressor", lambda params, body: {"compressor": self._platform.compressor_snapshot()})
@@ -147,6 +150,7 @@ class Api:
             hose_pressure_mpa=_as_float(body, "hose_pressure_mpa", 20.0),
             target_kg=_as_float(body, "target_kg", 20.0),
             dt=_as_float(body, "dt", 1.0),
+            interrupt_after=str(body.get("interrupt_after", "")) or None,
         )
 
     def _pressurize(self, params: dict, body: dict) -> dict:
@@ -163,6 +167,7 @@ class Api:
             rate_kg_per_min=_as_float(body, "rate_kg_per_min", 3.0),
             steps=int(body.get("steps", 3)),
             dt=_as_float(body, "dt", 36.0),
+            interrupt_after=str(body.get("interrupt_after", "")) or None,
         )
 
     def _stop(self, params: dict, body: dict) -> dict:

@@ -48,6 +48,12 @@ class FlowStep:
         self._current_kg = 0.0
         return self._steps
 
+    def restore(self, current_kg: float, completed: int) -> None:
+        """按检查点恢复阶梯台账。"""
+
+        self._current_kg = max(0.0, float(current_kg))
+        self._steps = max(0, int(completed))
+
     def completed(self) -> int:
         """返回已完成的阶梯数。"""
 

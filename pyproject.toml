@@ -25,6 +25,7 @@ packages = [
     "hydrorefuel.disp",
     "hydrorefuel.leak",
     "hydrorefuel.queue",
+    "hydrorefuel.recovery",
     "hydrorefuel.sequence",
     "hydrorefuel.console",
 ]
