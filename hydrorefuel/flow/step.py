@@ -52,3 +52,11 @@ class FlowStep:
         """返回已完成的阶梯数。"""
 
         return self._steps
+
+    def restore(self, completed: int, current_kg: float = 0.0) -> None:
+        """按落盘检查点重建阶梯进度，仅供断电恢复使用。"""
+
+        if completed < 0 or current_kg < 0.0:
+            raise ValueError("阶梯恢复量不能为负")
+        self._steps = int(completed)
+        self._current_kg = float(current_kg)

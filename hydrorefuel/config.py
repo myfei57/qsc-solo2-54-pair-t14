@@ -280,6 +280,7 @@ class StationConfig:
 
     name: str
     storage_root: str
+    recovery_policy: str
     truck: TruckLimits
     vent: VentLimits
     compressor: CompressorLimits
@@ -299,11 +300,15 @@ class StationConfig:
             raise ConfigError("station.name 必须是非空字符串", component="config")
         if not isinstance(storage_root, str) or not storage_root:
             raise ConfigError("station.storage_root 必须是非空字符串", component="config")
+        raw_policy = meta.get("recovery_policy", "resume")
+        if not isinstance(raw_policy, str) or raw_policy not in ("resume", "abort"):
+            raise ConfigError("station.recovery_policy 必须是 resume 或 abort", component="config")
 
         limits = _section(mapping, "limits")
         return cls(
             name=name,
             storage_root=storage_root,
+            recovery_policy=raw_policy,
             truck=TruckLimits.from_mapping(_section(limits, "truck")),
             vent=VentLimits.from_mapping(_section(limits, "vent")),
             compressor=CompressorLimits.from_mapping(_section(limits, "comp")),
@@ -334,6 +339,7 @@ def default_config() -> StationConfig:
     return StationConfig(
         name="refueling-control",
         storage_root="var/state",
+        recovery_policy="resume",
         truck=TruckLimits(25.0, 1.5, 90.0, 6.0),
         vent=VentLimits(6.0, 0.9, 0.1, 40.0),
         compressor=CompressorLimits(3.0, 43.0, 0.8, 1.2, 1.5),
@@ -350,7 +356,11 @@ def config_to_mapping(cfg: StationConfig) -> dict:
     """把配置还原成可打印的映射。"""
 
     return {
-        "station": {"name": cfg.name, "storage_root": cfg.storage_root},
+        "station": {
+            "name": cfg.name,
+            "storage_root": cfg.storage_root,
+            "recovery_policy": cfg.recovery_policy,
+        },
         "limits": {
             "truck": {
                 "hose_pressure_max_mpa": cfg.truck.hose_pressure_max_mpa,

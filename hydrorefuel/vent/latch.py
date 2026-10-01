@@ -62,3 +62,13 @@ class VentLatch:
         """返回累计释放次数。"""
 
         return self._resets
+
+    def restore(self, engaged: bool, cycles: int = 0, resets: int = 0) -> None:
+        """按落盘检查点重建闩锁状态，仅供断电恢复使用。"""
+
+        if cycles < 0 or resets < 0:
+            raise ValueError("闩锁计数不能为负")
+        self._engaged = bool(engaged)
+        self._traveled_mm = self._travel_mm if self._engaged else 0.0
+        self._cycles = int(cycles)
+        self._resets = int(resets)

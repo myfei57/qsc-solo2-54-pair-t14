@@ -40,7 +40,10 @@ from .ns.topology import Topology, build_default_topology
 from .queue.confirm import Confirmation
 from .queue.queue import FillQueue
 from .queue.snapshot import QueueSnapshot
-from .sequence import fill_vehicle, pressurize_buffer, stop_fill, unload_truck
+from .recovery import POLICY_ABORT, RecoveryManager
+from .recovery.checkpoint import OP_FILL, OP_UNLOAD, RECOVERY_SCOPE
+from .recovery.resume import resume_fill, resume_unload
+from .sequence import pressurize_buffer, stop_fill
 from .store.journal import JsonlJournal
 from .store.jsonfile import JsonStore
 from .telemetry import TrendBuffer
@@ -103,11 +106,13 @@ class Platform:
         self.leak_latch = LeakLatch(self.config.leak.hold_s)
         self.queue = FillQueue(self.config.queue)
         self.confirm = Confirmation(self.config.queue.confirm_timeout_s)
+        self.recovery = RecoveryManager(store, self.clock, unit, self.config.recovery_policy)
 
         self._cycles = 0
         self._operations = 0
         self._running = False
         self._last_audit_ts = 0.0
+        self._resume_cache: dict[str, dict] = {}
         self._lock = threading.RLock()
         self._register_namespaces()
         self._restore()
@@ -130,7 +135,7 @@ class Platform:
             self.namespaces.register(area, device, kind)
 
     def _restore(self) -> None:
-        """从落盘状态恢复平台计数，保证重启后计数连续。"""
+        """从落盘状态恢复平台计数；存在未完成工位作业时重建现场。"""
 
         tail = self.audit.replay_from_journal(limit=1)
         if tail:
@@ -139,14 +144,249 @@ class Platform:
         if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
+            self.bank.restore(
+                float(state.get("buffer_pressure_mpa", 0.0)),
+                float(state.get("buffer_stored_kg", 0.0)),
+            )
+        checkpoint = self.recovery.get()
+        if checkpoint is not None and not checkpoint.terminal:
+            self._restore_checkpoint(checkpoint)
+            checkpoint = self.recovery.mark_interrupted()
+        if checkpoint is not None:
+            decision = checkpoint.decision_record()
+            event_payload = {
+                key: value for key, value in decision.items() if key not in ("station", "op_id")
+            }
+            self.bus.publish(
+                Event.of(
+                    "recovery",
+                    "recovery",
+                    "recovery_decision",
+                    station=self.unit,
+                    op_id=checkpoint.op_id,
+                    severity="warning" if checkpoint.interrupted else "notice",
+                    message=(
+                        "工位作业可安全续作"
+                        if decision["decision"] == "resume"
+                        else "工位作业将按隔离顺序收尾"
+                    ),
+                    **event_payload,
+                )
+            )
+
+    def _restore_checkpoint(self, checkpoint) -> None:
+        """按检查点重建作业涉及的设备；恢复范围固定为当前工位。"""
+
+        if checkpoint.operation == OP_UNLOAD:
+            vents = int(checkpoint.params.get("truck_vents", 0))
+            state = {
+                "connect": "connected",
+                "latch_engage": "connected",
+                "open_unload": "unloading",
+                "transfer": "unloading",
+                "finish_unload": "connected",
+                "vent_open": "connected",
+                "vent_hold": "connected",
+                "vent_close": "connected",
+            }.get(checkpoint.stage, "drained")
+            self.truck.restore(
+                state,
+                checkpoint.truck_pressure_mpa,
+                checkpoint.completed_kg,
+                vents=vents,
+            )
+            if checkpoint.stage == "init":
+                self.vent.restore(False, bursts=0, vented_mpa=0.0)
+                self.vent_latch.restore(False)
+            elif checkpoint.stage == "connect":
+                self.vent.restore(False, bursts=0, vented_mpa=0.0)
+                self.vent_latch.restore(False)
+            else:
+                vent_open = checkpoint.stage in ("vent_open", "vent_hold")
+                self.vent.restore(vent_open, bursts=1, vented_mpa=checkpoint.vented_mpa)
+                self.vent_latch.restore(checkpoint.stage not in ("vent_close", "disconnect"))
+        elif checkpoint.operation == OP_FILL:
+            if "buffer_stored_kg" in checkpoint.params:
+                self.bank.restore(
+                    float(checkpoint.params.get("buffer_pressure_mpa", 0.0)),
+                    float(checkpoint.params.get("buffer_stored_kg", 0.0)),
+                )
+            seated = checkpoint.stage not in ("init", "confirm", "unseat_nozzle")
+            self.nozzle.restore(seated, cycles=1 if seated else 0)
+            valve_open = checkpoint.stage in ("open_fill_valve", "transfer")
+            dispenser_state = {
+                "fill_complete": "filling",
+                "isolated": "filling",
+                "stopped": "stopped",
+            }.get(checkpoint.stage, "filling" if valve_open else "idle")
+            self.dispenser.restore(dispenser_state, valve_open)
+            self.meter.restore(checkpoint.meter_total_kg, checkpoint.rate_kg_per_min)
+            self.flow_step.restore(checkpoint.step_completed, checkpoint.step_current_kg)
+            self.temperature.restore(float(checkpoint.params.get("temperature_c", 25.0)))
+            self.precooler.restore(
+                "ready" if checkpoint.stage not in ("init", "confirm", "seat_nozzle") else "idle",
+                held_s=float(checkpoint.params.get("held_s", 0.0)),
+            )
+            if checkpoint.stage not in ("init",):
+                self.confirm.restore_confirmed(checkpoint.vehicle, checkpoint.created_ts)
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
 
+        self._persist_runtime()
+
+    def _persist_runtime(self) -> None:
         self.store.write(
             "platform_state",
-            {"operations": self._operations, "cycles": self._cycles, "unit": self.unit},
+            {
+                "operations": self._operations,
+                "cycles": self._cycles,
+                "unit": self.unit,
+                "buffer_pressure_mpa": self.bank.pressure_mpa,
+                "buffer_stored_kg": self.bank.stored_kg,
+            },
         )
+
+    def _finish_resumable(self, op_id: str, operation: str, report: dict) -> None:
+        checkpoint = self.recovery.get()
+        terminal = bool(report.get("ok"))
+        if terminal and checkpoint is not None and checkpoint.op_id == op_id:
+            if checkpoint.terminal:
+                self.recovery.clear()
+                self._resume_cache.pop(op_id, None)
+            # 正常加注完成后仍保持带压连接，等待 /stop 按隔离顺序收枪。
+        elif checkpoint is not None and checkpoint.op_id == op_id:
+            self.recovery.mark_interrupted()
+        summary = self._record_operation(op_id, operation, report)
+        report.update(summary)
+        self._operations += 1
+        self._persist_runtime()
+
+    def recovery_status(self) -> dict:
+        """返回工位恢复判断；控制台展示与审计使用同一份检查点口径。"""
+
+        with self._lock:
+            checkpoint = self.recovery.get()
+            if checkpoint is None:
+                return {"scope": RECOVERY_SCOPE, "station": self.unit, "pending": False, "policy": self.recovery.policy}
+            return {"scope": RECOVERY_SCOPE, "station": self.unit, "pending": not checkpoint.terminal, **checkpoint.decision_record()}
+
+    def resume_operation(self, use_cache: bool = True) -> dict:
+        """按当前工位策略执行恢复；重复触发同一阶段时幂等返回。"""
+
+        with self._lock:
+            checkpoint = self.recovery.get()
+            if checkpoint is None:
+                return {
+                    "station": self.unit,
+                    "ok": True,
+                    "resumed": False,
+                    "idempotent": True,
+                    "steps": [],
+                    "violations": [],
+                }
+            operation = OP_UNLOAD if checkpoint.operation == OP_UNLOAD else OP_FILL
+            cache_key = checkpoint.op_id
+            if use_cache and cache_key in self._resume_cache:
+                return {**self._resume_cache[cache_key], "idempotent": True}
+            if checkpoint.terminal:
+                self.recovery.clear()
+                report = {
+                    "station": checkpoint.station,
+                    "ok": True,
+                    "resumed": True,
+                    "idempotent": True,
+                    "steps": [],
+                    "violations": [],
+                    "decision": POLICY_ABORT,
+                }
+                summary = self._record_operation(checkpoint.op_id, f"resume_{operation}", report)
+                report.update(summary)
+                return report
+
+            def on_stage(updated) -> None:
+                previous = self.recovery.get()
+                if updated.operation == OP_FILL:
+                    added = max(0.0, updated.accounted_kg - (previous.accounted_kg if previous else 0.0))
+                    if added > 0.0:
+                        self.bank.draw(added)
+                    updated = updated.advanced(
+                        updated.stage,
+                        updated.updated_ts,
+                        params={
+                            **updated.params,
+                            "buffer_pressure_mpa": self.bank.pressure_mpa,
+                            "buffer_stored_kg": self.bank.stored_kg,
+                        },
+                    )
+                self.recovery.save(updated)
+                self._persist_runtime()
+
+            if operation == OP_UNLOAD:
+                report = resume_unload(checkpoint, self.truck, self.vent, self.vent_latch, on_stage=on_stage)
+            else:
+                report = resume_fill(
+                    checkpoint,
+                    self.dispenser,
+                    self.nozzle,
+                    self.precooler,
+                    self.temperature,
+                    self.meter,
+                    self.flow_step,
+                    self.confirm,
+                    on_stage=on_stage,
+                )
+            self._finish_resumable(checkpoint.op_id, f"resume_{operation}", report)
+            if use_cache:
+                self._resume_cache[cache_key] = dict(report)
+            return report
+
+    def interrupt_operation(self) -> dict:
+        """手动停止当前工位作业：只标记断点，不改变设备状态。"""
+
+        with self._lock:
+            checkpoint = self.recovery.mark_interrupted()
+            if checkpoint is None:
+                return {"station": self.unit, "interrupted": False, "pending": False}
+            decision = checkpoint.decision_record()
+            event_payload = {
+                key: value for key, value in decision.items() if key not in ("station", "op_id")
+            }
+            self.bus.publish(
+                Event.of(
+                    "recovery",
+                    "recovery",
+                    "operation_interrupted",
+                    station=self.unit,
+                    op_id=checkpoint.op_id,
+                    severity="warning",
+                    message="工位作业已被手动停止",
+                    **event_payload,
+                )
+            )
+            self._persist_runtime()
+            return {"station": self.unit, "interrupted": True, "pending": not checkpoint.terminal, **checkpoint.decision_record()}
+
+    def stop_unload(self) -> dict:
+        """手动停止卸氢：断点标记后立即按隔离顺序泄压拔管。"""
+
+        with self._lock:
+            checkpoint = self.recovery.get()
+            if checkpoint is None or checkpoint.operation != OP_UNLOAD or checkpoint.terminal:
+                return {
+                    "station": self.unit,
+                    "ok": checkpoint is not None,
+                    "resumed": False,
+                    "steps": [],
+                    "violations": [] if checkpoint is not None else ["not_unloading"],
+                }
+            self.recovery.mark_interrupted()
+            forced = self.recovery.mutate(lambda item: item.advanced(item.stage, self.clock.now(), policy=POLICY_ABORT))
+            report = self.resume_operation(use_cache=False)
+            report["stop_requested"] = True
+            report["forced_decision"] = forced.decision
+            return report
+
 
     def _record_operation(self, op_id: str, operation: str, report: dict) -> dict:
         """把编排步骤逐条写审计，并记一条汇总事件。"""
@@ -234,11 +474,31 @@ class Platform:
 
         with self._lock:
             op_id = self.ids.next()
-            report = unload_truck(self.truck, self.vent, self.vent_latch, self.unit, hose_pressure_mpa, target_kg, dt)
-            summary = self._record_operation(op_id, "unload", report)
-            self._operations += 1
-            self._persist()
-            return {**report, **summary}
+            self.truck.reset()
+            self.vent.restore(False)
+            self.vent_latch.restore(False)
+            checkpoint = self.recovery.start(
+                op_id=op_id,
+                operation=OP_UNLOAD,
+                stage="init",
+                target_kg=target_kg,
+                dt=dt,
+                hose_pressure_mpa=hose_pressure_mpa,
+            )
+
+            def on_stage(updated) -> None:
+                self.recovery.save(updated)
+                self._persist_runtime()
+
+            report = resume_unload(
+                checkpoint,
+                self.truck,
+                self.vent,
+                self.vent_latch,
+                on_stage=on_stage,
+            )
+            self._finish_resumable(op_id, "unload", report)
+            return report
 
     def pressurize(
         self,
@@ -284,8 +544,54 @@ class Platform:
             except HydroError as error:
                 self.note_error(error)
                 return {"station": self.unit, "vehicle": vehicle, "ok": False, "violations": ["line_pressure_high"]}
-            before = self.meter.total_kg()
-            report = fill_vehicle(
+            self.meter.restore(0.0, 0.0)
+            self.flow_step.restore(0, 0.0)
+            self.dispenser.reset()
+            self.confirm.clear(vehicle)
+            if self.nozzle.is_seated():
+                self.nozzle.unseat()
+            self.temperature.reset()
+            self.precooler.reset()
+            target_kg = self.flow_step.target_kg * steps
+            checkpoint = self.recovery.start(
+                op_id=op_id,
+                operation=OP_FILL,
+                stage="init",
+                vehicle=vehicle,
+                target_kg=target_kg,
+                steps_requested=steps,
+                rate_kg_per_min=rate_kg_per_min,
+                dt=dt,
+                meter_total_kg=0.0,
+                params={
+                    "temperature_c": self.temperature.value_c,
+                    "held_s": 0.0,
+                    "buffer_pressure_mpa": self.bank.pressure_mpa,
+                    "buffer_stored_kg": self.bank.stored_kg,
+                },
+            )
+
+            def on_stage(updated) -> None:
+                previous = self.recovery.get()
+                added = max(0.0, updated.accounted_kg - (previous.accounted_kg if previous else 0.0))
+                if added > 0.0:
+                    # 扣账和检查点在同一把工位锁内；恢复优先用检查点内的已扣账瓶组存量。
+                    self.bank.draw(added)
+                self.recovery.save(
+                    updated.advanced(
+                        updated.stage,
+                        updated.updated_ts,
+                        params={
+                            **updated.params,
+                            "buffer_pressure_mpa": self.bank.pressure_mpa,
+                            "buffer_stored_kg": self.bank.stored_kg,
+                        },
+                    )
+                )
+                self._persist_runtime()
+
+            report = resume_fill(
+                checkpoint,
                 self.dispenser,
                 self.nozzle,
                 self.precooler,
@@ -293,27 +599,23 @@ class Platform:
                 self.meter,
                 self.flow_step,
                 self.confirm,
-                self.unit,
-                vehicle=vehicle,
-                rate_kg_per_min=rate_kg_per_min,
-                steps=steps,
-                now=self.clock.now(),
-                dt=dt,
+                on_stage=on_stage,
             )
-            if report["ok"]:
-                try:
-                    self.bank.draw(self.meter.total_kg() - before)
-                except HydroError as error:
-                    self.note_error(error)
-            summary = self._record_operation(op_id, "fill", report)
-            self._operations += 1
-            self._persist()
-            return {**report, **summary}
+            self._finish_resumable(op_id, "fill", report)
+            return report
 
     def stop_fill(self) -> dict:
-        """停止加注编排：先隔离，再停机。"""
+        """手动停止加注：按隔离顺序安全收尾，不重复计量。"""
 
         with self._lock:
+            checkpoint = self.recovery.get()
+            if checkpoint is not None and checkpoint.operation == OP_FILL and not checkpoint.terminal:
+                self.recovery.mark_interrupted()
+                self.recovery.mutate(lambda item: item.advanced(item.stage, self.clock.now(), policy=POLICY_ABORT))
+                report = self.resume_operation(use_cache=False)
+                report["stop_requested"] = True
+                return report
+
             op_id = self.ids.next()
             report = stop_fill(self.dispenser, self.unit)
             if report["ok"]:
@@ -528,9 +830,14 @@ class Platform:
             self.temperature.reset()
             self.precooler.reset()
             self.meter.reset()
+            self.flow_step.restore(0, 0.0)
+            self.vent.restore(False)
+            self.vent_latch.restore(False)
+            self.nozzle.restore(False)
             self.leak.reset()
             self.dispenser.reset()
             self.queue.reset()
+            self.recovery.clear()
             removed = self.store.remove("platform_state") if self.store.exists("platform_state") else False
             self._operations = 0
             self._cycles = 0
@@ -668,6 +975,7 @@ class Platform:
             "confirm_timeout_s": self.confirm.timeout_s,
             "leak_samples": self.leak.samples(),
             "last_audit_ts": self._last_audit_ts,
+            "recovery": self.recovery_status(),
             "audit": self.audit.summary(),
         }
 

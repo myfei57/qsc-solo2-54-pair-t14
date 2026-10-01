@@ -126,6 +126,24 @@ class TruckMachine:
         self._vents = 0
         return was_active
 
+    def restore(
+        self,
+        state: str,
+        pressure_mpa: float,
+        delivered_kg: float,
+        vents: int = 0,
+    ) -> None:
+        """按落盘检查点重建槽车现场，仅供断电恢复使用。"""
+
+        if state not in (IDLE, CONNECTED, UNLOADING, DRAINED):
+            raise ValueError("未知的槽车状态")
+        if pressure_mpa < 0.0 or delivered_kg < 0.0 or vents < 0:
+            raise ValueError("槽车恢复量不能为负")
+        self._state = state
+        self._pressure_mpa = float(pressure_mpa)
+        self._delivered_kg = float(delivered_kg)
+        self._vents = int(vents)
+
     def snapshot(self) -> TruckSnapshot:
         """返回槽车状态快照。"""
 

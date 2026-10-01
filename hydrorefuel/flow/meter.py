@@ -53,3 +53,11 @@ class MassFlowMeter:
 
         self._rate_kg_per_min = 0.0
         self._total_kg = 0.0
+
+    def restore(self, total_kg: float, rate_kg_per_min: float = 0.0) -> None:
+        """按落盘检查点重建累计质量，仅供断电恢复使用。"""
+
+        if total_kg < 0.0 or rate_kg_per_min < 0.0:
+            raise ValueError("流量恢复量不能为负")
+        self._total_kg = float(total_kg)
+        self._rate_kg_per_min = float(rate_kg_per_min)

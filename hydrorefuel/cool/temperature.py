@@ -43,3 +43,8 @@ class TemperatureModel:
         """把温度恢复到环境温度。"""
 
         self._value_c = AMBIENT_C
+
+    def restore(self, value_c: float) -> None:
+        """按落盘检查点重建枪口温度，仅供断电恢复使用。"""
+
+        self._value_c = float(value_c)

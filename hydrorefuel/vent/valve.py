@@ -70,3 +70,12 @@ class VentValve:
         """返回累计开阀次数。"""
 
         return self._bursts
+
+    def restore(self, open_: bool, bursts: int = 0, vented_mpa: float = 0.0) -> None:
+        """按落盘检查点重建放散阀阀位，仅供断电恢复使用。"""
+
+        if bursts < 0 or vented_mpa < 0.0:
+            raise ValueError("放散恢复量不能为负")
+        self._open = bool(open_)
+        self._bursts = int(bursts)
+        self._vented_mpa = float(vented_mpa)

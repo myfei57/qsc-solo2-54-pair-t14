@@ -64,3 +64,11 @@ class Precooler:
         self._state = IDLE
         self._held_s = 0.0
         return was_ready
+
+    def restore(self, state: str, held_s: float = 0.0) -> None:
+        """按落盘检查点重建预冷状态，仅供断电恢复使用。"""
+
+        if state not in (IDLE, COOLING, READY) or held_s < 0.0:
+            raise ValueError("非法的预冷恢复状态")
+        self._state = state
+        self._held_s = self._limits.precool_hold_s if state == READY else float(held_s)

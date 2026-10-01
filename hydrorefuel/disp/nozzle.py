@@ -66,3 +66,13 @@ class Nozzle:
         """返回累计落座次数。"""
 
         return self._cycles
+
+    def restore(self, seated: bool, cycles: int = 0) -> None:
+        """按落盘检查点重建枪位，仅供断电恢复使用。"""
+
+        if cycles < 0:
+            raise ValueError("落座计数不能为负")
+        self._seated = bool(seated)
+        self._latch_engaged = bool(seated)
+        self._travel_mm = self._seat_travel_mm if seated else 0.0
+        self._cycles = int(cycles)

@@ -79,3 +79,13 @@ class BufferBank:
 
         self._pressure_mpa = 0.0
         self._stored_kg = 0.0
+
+    def restore(self, pressure_mpa: float, stored_kg: float) -> None:
+        """按落盘状态重建瓶组压力与存量，仅供断电恢复使用。"""
+
+        if pressure_mpa < 0.0 or stored_kg < 0.0:
+            raise ValueError("瓶组恢复量不能为负")
+        if stored_kg > self._limits.capacity_kg + 1e-9:
+            raise PressureError("瓶组恢复存量超过容量", component="buffer")
+        self._pressure_mpa = float(pressure_mpa)
+        self._stored_kg = float(stored_kg)

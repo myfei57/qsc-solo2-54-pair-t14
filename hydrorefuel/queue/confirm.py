@@ -78,3 +78,10 @@ class Confirmation:
                 (vehicle for vehicle in self._pending if vehicle not in self._confirmed),
                 key=lambda vehicle: self._pending[vehicle],
             )
+
+    def restore_confirmed(self, vehicle: str, now: float) -> None:
+        """按检查点重建已完成确认，仅供断电恢复使用。"""
+
+        with self._lock:
+            self._pending[vehicle] = float(now)
+            self._confirmed[vehicle] = float(now)

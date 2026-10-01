@@ -88,6 +88,16 @@ class Dispenser:
         self._state = IDLE
         return was_filling
 
+    def restore(self, state: str, valve_open: bool) -> None:
+        """按落盘检查点重建加注机状态，仅供断电恢复使用。"""
+
+        if state not in (IDLE, FILLING, STOPPED):
+            raise ValueError("未知的加注机状态")
+        if valve_open and state != FILLING:
+            raise ValueError("只有加注中才允许加注阀保持打开")
+        self._state = state
+        self._valve_open = bool(valve_open)
+
     def snapshot(self) -> DispSnapshot:
         """返回加注机状态快照。"""
 
